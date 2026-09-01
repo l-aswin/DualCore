@@ -1,0 +1,4 @@
+.pio/
+.vscode/
+# Build output is redirected out of the tree (see platformio.ini), but ignore a
+# local .pio just in case a default build ever lands here.
