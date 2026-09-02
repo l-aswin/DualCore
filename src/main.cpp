@@ -1,4 +1,4 @@
-// NitroWorks ECU - DualCore sprint - STEP 1: two tasks, one per core
+ // NitroWorks ECU - DualCore sprint - STEP 1: two tasks, one per core
 //
 // Goal of this step: the skeleton only. setup() creates two FreeRTOS tasks
 // pinned to opposite cores and returns; loop() does nothing. Each task prints
@@ -6,7 +6,9 @@
 // serial monitor.
 //
 //   btTask -> core 0  (will own Bluepad32 + the gamepad from step 2 on)
-//   uiTask -> core 1  (will own the OLED + LED status pattern from step 3 on)
+//   uiTask -> core 1  (will own the OLED + the `led_pattern` ring/buzzer command
+//                      emit from step 3 on -- the ring itself is on the comms
+//                      ESP32 as of ECU-SPEC-001 rev 5, so no local pixels)
 //
 // The user's "Core 1 / Core 2" == the ESP32's core 0 / core 1. ECU-ADR-004 pins
 // Bluepad32 to core 0 and all application tasks to core 1; here btTask sits on
@@ -19,18 +21,19 @@
 //      must keep ticking straight through it (and swap the flag to test the
 //      other direction)
 
+
 #include <Arduino.h>
 
 // Set to 1 to make uiTask burn the CPU for 3 s every ~10 s (step-1 isolation
 // test). btTask must stay responsive through the spin. Ship at 0.
-#define ISOLATION_TEST 0
+#define ISOLATION_TEST 1
 
 constexpr int PIN_BT_HEARTBEAT_LED = 2;   // btTask toggles this ~1 Hz (GPIO2 Mode LED)
 
 static void logStack(const char* who) {
   // High-water mark = smallest free stack seen so far, in words (4 bytes each).
-  Serial.printf("%s  stack high-water: %u words free\n",
-                who, (unsigned)uxTaskGetStackHighWaterMark(nullptr));
+  Serial.printf("%s  stack high-water: %u bytes free\n",
+                who, (unsigned)uxTaskGetStackHighWaterMark(nullptr) * sizeof(StackType_t));
 }
 
 // ---- core 0: will become the Bluetooth / gamepad task ----------------------
@@ -75,7 +78,7 @@ void uiTask(void*) {
 }
 
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(115200); 
   delay(200);
   pinMode(PIN_BT_HEARTBEAT_LED, OUTPUT);
   digitalWrite(PIN_BT_HEARTBEAT_LED, LOW);
@@ -83,6 +86,11 @@ void setup() {
   Serial.println();
   Serial.println("NitroWorks ECU - DualCore sprint - STEP 1 (two tasks, one per core)");
   Serial.printf("setup() runs on core %d\n", xPortGetCoreID());
+
+  Serial.printf("free heap before tasks: %u B  (largest block %u B, min ever %u B)\n",
+                (unsigned)ESP.getFreeHeap(),
+                (unsigned)ESP.getMaxAllocHeap(),
+                (unsigned)ESP.getMinFreeHeap());
 
   xTaskCreatePinnedToCore(btTask, "bt", 8192, nullptr, 3, nullptr, 0);  // core 0
   xTaskCreatePinnedToCore(uiTask, "ui", 4096, nullptr, 1, nullptr, 1);  // core 1

@@ -1,10 +1,15 @@
 # DualCore — staged build log
 
 This sprint splits the ECU firmware across the ESP32's two cores (ECU-ADR-004):
-**core 0** = Bluepad32 + gamepad (`btTask`), **core 1** = OLED + LED status
-pattern (`uiTask`). It clones `BluetoothPairing` and adds the core split, then
-wires the OLED to real Bluetooth events and real stick input, then adds battery
-sensing with a hard power cut-off.
+**core 0** = Bluepad32 + gamepad (`btTask`), **core 1** = OLED + `led_pattern`
+command emit (`uiTask`). It clones `BluetoothPairing` and adds the core split, then
+wires the OLED to real Bluetooth events and real stick input, then adds the
+`powerState` input and the CRITICAL response.
+
+> **Rev 5 note (2026-09-01):** the WS2812B ring + buzzer moved to the TCU
+> and battery sensing moved to the BMS (ECU-SPEC-001 rev 5). So `uiTask` no longer
+> *animates* LEDs — it emits `RING …` / `BUZZ …` commands over UART1 — and there is
+> no on-ECU `battTask`. Steps 3 and 5 below reflect that.
 
 The user's "Core 1 / Core 2" = the ESP32's core 0 / core 1.
 
@@ -52,20 +57,22 @@ pio device monitor
 
 **Results** _(fill in after running on hardware)_
 
-- [ ] both tasks report the expected cores
-- [ ] stack high-water: bt = ____ words, ui = ____ words
-- [ ] isolation test: btTask kept beating through uiTask's spin — yes / no
+- [ ] both tasks report the expected cores - yes
+- [ ] stack high-water: bt = 1667 words, ui = 624 words
+- [ ] isolation test: btTask kept beating through uiTask's spin — yes
 - notes:
-
+keep loop() with min delay of 10ms. arduino loop runs on core 1. If no sleep is given core1 run at 100% and trigger watchdog warning
 ---
 
 ## Step 2 — Bluepad32 owned by the core-0 task  · branch `step-2-bluepad32`
 
 _not started_
 
-## Step 3 — pairing state machine (core 0) + UI mockup browser (core 1)  · branch `step-3-pairing-plus-mockup`
+## Step 3 — pairing state machine (core 0) + OLED / ring-command emit (core 1)  · branch `step-3-pairing-plus-mockup`
 
-_not started_
+_not started._ core 1 renders the OLED screens (ECU-SPEC-002) **and** emits the
+matching `RING …` command on each `linkState` change (no local pixels — the ring is
+on the TCU). For this sprint the TCU end is a serial print / loopback stub.
 
 ## Step 4a — naive `volatile` shared struct  · branch `step-4a-volatile`
 
@@ -75,16 +82,22 @@ _not started_
 
 _not started_
 
-## Step 5 — 3S LiPo voltage sensing + hard cut-off  · branch `step-5-battery-cutoff`
+## Step 5 — `powerState` input + CRITICAL response  · branch `step-5-powerstate`
 
-_not started_
+_not started._ Battery *sensing* is the BMS's now (ECU-SPEC-001 rev 5), so this step
+no longer reads a divider. It feeds a simulated `powerState` (button or timer →
+`WARNING` → `CRITICAL`) into `RobotState` and exercises the ECU's reaction under the
+core split: `motor_control` zeros + holds, the BLE path tears down, `oled_ui` shows S0,
+`led_pattern` emits `RING OFF` + `BUZZ S0`. The G4-relevant question is whether the
+split holds timing while a CRITICAL event forces a screen change + motor stop at once.
 
 ---
 
 ## G4 verdict
 
 _Pending. After step 5, run with everything active (gamepad connected, stick
-moving, OLED redrawing S4, LEDs animating, battTask sampling) and log the
-`btTask` loop-interval min/max/mean over 60 s. "Split holds" feeds the initial
-commit of `07_Codebase_Repository`; "needs amendment" goes back into
-ECU-ADR-004 / ECU-SPEC-001 §9._
+moving, OLED redrawing S4, `RING …` / `BUZZ …` commands going out on UART1, a
+simulated `powerState` CRITICAL forcing S0 + motor stop) and log the `btTask`
+loop-interval min/max/mean over 60 s. "Split holds" feeds the initial commit of
+`07_Codebase_Repository`; "needs amendment" goes back into ECU-ADR-004 /
+ECU-SPEC-001 §9._
