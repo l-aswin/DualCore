@@ -119,11 +119,98 @@ pio device monitor
 - [ yes] isolation test: BT poll and `uiTask` each ride through the other's spin
 - notes:
 
-## Step 3 — pairing state machine (core 0) + OLED / ring-command emit (core 1)  · branch `step-3-pairing-plus-mockup`
+## Step 3 — pairing state machine (core 0) + OLED / ring-command emit (core 1)  · branch `step-3-pairing-state-machine+OLED-display`
 
-_not started._ core 1 renders the OLED screens (ECU-SPEC-002) **and** emits the
-matching `RING …` command on each `linkState` change (no local pixels — the ring is
-on the TCU). For this sprint the TCU end is a serial print / loopback stub.
+Branched off the `step-2` tag. core 0 runs the full pairing state machine; core 1
+renders the OLED screens (ECU-SPEC-002) **and** emits the matching `RING …`
+command on each `linkState` change (no local pixels — the ring is on the TCU).
+For this sprint the TCU end is a serial-print / loopback stub.
+
+**What changed**
+
+- `platformio.ini`: unchanged — `Adafruit SH110X` / `GFX` were already in from step 1,
+  `Preferences` + `Wire` are framework libs.
+- `src/main.cpp`:
+  - **core 0 / `btTask`** — the pairing state machine cloned from the
+    `BluetoothPairing` sprint: NVS `nitro-ecu` / `bonded` flag, debounced Pair
+    (GPIO15) + Reset (GPIO13) buttons, `openPairingWindow()` /
+    `closePairingWindow()`, and the "reject unexpected controller (no bond, not
+    pairing)" guard in `onConnectedController`. `setup()`'s boot branch (bonded →
+    Search / `enableNewBluetoothConnections(false)`; unbonded → auto Pair) moved
+    into `btTask` since the BT stack must come up on core 0.
+  - `btTask` each loop polls the buttons, calls `BP32.update()`, then reduces the
+    gamepad to `computeLinkState()` (`SEARCH` / `PAIR` / `CONNECTED`) + the two
+    S4 axes (`throttle` = −axisY, `steer` = axisX) and publishes them.
+  - **Pair-press transition** — `openPairingWindow()` flips `linkState` to `PAIR`
+    immediately but **defers** `forgetBluetoothKeys()` +
+    `enableNewBluetoothConnections(true)` by `PAIR_SETUP_DEFER_MS` (200 ms): the
+    BT thread's NVS key-wipe stalls core 1's flash reads, so the deferral lets
+    the OLED paint first. Pressing Pair (from SCAN/CONNECTED) also stamps
+    `g_pairBlankAtMs`, and `uiTask` renders a **header-only frame** (battery
+    strip + divider, blank below) for `PAIR_BLANK_MS` (600 ms) as deliberate
+    press feedback before S2 PAIR. A re-press while already pairing shows no
+    blank.
+  - **Cross-core sharing is naive on purpose** — a handful of `volatile` scalars
+    (`g_linkState`, `g_hasBond`, `g_connected`, `g_throttle`, `g_steer`,
+    `g_connectedAtMs`, `g_resetToastAtMs`, `g_pairBlankAtMs`), core 0 writes,
+    core 1 reads, no lock.
+    Step 4a promotes this to a struct; 4b adds the mutex + snapshot.
+  - **core 1 / `uiTask`** — brings up the SH1106 (`Wire` on 21/22, addr `0x3C`)
+    and renders at ~6 Hz (`UI_FRAME_MS` 166): **S1 SCAN** / **S2 PAIR** (shared
+    layout, size-3 word + large BT glyph & cycling searching waves), **S3 READY**
+    (bold glyph, all waves solid + dot, held `S3_HOLD_MS` 1.5 s), **S4** stick-check
+    HUD (status strip + connected icon; Idle gamepad glyph / `ACC ▶` / `REV ◀` /
+    `TURN L` / `TURN R` with a rescaled % bar; most-recently-active axis owns
+    Area 2 with a 400 ms linger back to Idle), **S5 RESET…** toast (~1 s after the
+    Reset button, then falls through to S2). Status strip renders its **normal**
+    state only — `powerState` / warning / **S0** are step 5, and `BATT_PCT_STUB`
+    stands in for a state-of-charge the ECU never actually receives (BMS owns it).
+  - The OLED draw helpers (`drawBtGlyph` / `drawWaves` / `drawStatusStrip` /
+    `drawWord` / `renderSearchLike` / `renderConnected` / `fillTri` / the S4
+    body) are a **verbatim port of `BluetoothUIMockup/src/main.cpp`** — the
+    pixel-accurate reference for ECU-SPEC-002, tuned on the real panel. DualCore
+    supplies only the live inputs: `g_linkState` picks the screen and the real
+    gamepad sticks drive S4 via `s4PickAxis()` (the mockup cycles S4 on a timer
+    because it has no joystick).
+  - `uiTask` also owns the UART1 TX for this sprint: on every `linkState` change
+    it emits `RING SEARCH_BLINK` / `RING PAIR_BLINK` / `RING CONNECTED` (+ `BUZZ
+    CONNECT` on connect) via `Serial1` (RX 16 / TX 17), mirrored to USB as `tx>`;
+    bytes coming back on UART1 RX print as `rx<` (jumper 17→16 to see the round trip).
+  - `ISOLATION_TEST` kept, default 0; the uiTask spin now runs against real rendering.
+
+**How to verify**
+
+```
+$env:PATH += ";$env:USERPROFILE\.platformio\penv\Scripts"; pio run -e esp32dev
+pio run -e esp32dev -t upload
+pio device monitor
+```
+
+1. Boot **bonded**: OLED shows **S1 SCAN** with cycling waves, monitor prints
+   `tx> RING SEARCH_BLINK`, `ui started on core 1` / `bt … link=SEARCH`.
+2. Press **Pair**: OLED → **S2 PAIR**, `tx> RING PAIR_BLINK`, Mode LED fast-blink.
+3. Connect a controller: `tx> RING CONNECTED` + `tx> BUZZ CONNECT`, OLED shows
+   **S3 READY** ~1.5 s then the **S4** HUD. Wiggle the left stick → `ACC` / `REV`
+   / `TURN L` / `TURN R` with the bar tracking, returns to the Idle gamepad glyph
+   ~400 ms after re-centre.
+4. Power the controller off: OLED → **S1 SCAN**, `tx> RING SEARCH_BLINK`,
+   `bt` heartbeat uninterrupted.
+5. Press **Reset**: **S5 RESET…** toast ~1 s → **S2 PAIR**; `Boot: NVS bonded
+   flag = 0` on the next power cycle.
+6. Record `bt` / `ui` stack high-water (printed every ~10 beats / ~30 frames);
+   both must keep headroom with the OLED redrawing.
+7. `-D ISOLATION_TEST=1`: uiTask's 3 s spin must not stall `BP32.update()`, and
+   btTask's spin must not freeze the OLED. Set back to 0.
+
+**Results** _(fill in after running on hardware)_
+
+- [ ] boot bonded → S1, `RING SEARCH_BLINK` emitted once
+- [ ] Pair → S2, `RING PAIR_BLINK`; Reset → S5 → S2, bond cleared
+- [ ] connect → S3 (~1.5 s) → S4; sticks drive ACC / REV / TURN with linger
+- [ ] disconnect → S1, heartbeat uninterrupted
+- [ ] stack high-water: bt = ____ words, ui = ____ words
+- [ ] isolation test: OLED redraw and BT poll each ride through the other's spin
+- notes:
 
 ## Step 4a — naive `volatile` shared struct  · branch `step-4a-volatile`
 
