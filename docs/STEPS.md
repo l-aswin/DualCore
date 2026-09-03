@@ -124,7 +124,11 @@ pio device monitor
 Branched off the `step-2` tag. core 0 runs the full pairing state machine; core 1
 renders the OLED screens (ECU-SPEC-002) **and** emits the matching `RING …`
 command on each `linkState` change (no local pixels — the ring is on the TCU).
-For this sprint the TCU end is a serial-print / loopback stub.
+
+**Test rig for this step: OLED + the two buttons only.** No ring LED, no TCU
+chip. The `RING …` / `BUZZ …` bytes still go out UART1 TX — that path is code,
+not something this step verifies. Verification below is OLED + button behaviour;
+the ring/UART link is exercised in the TCU sprint.
 
 **What changed**
 
@@ -174,8 +178,10 @@ For this sprint the TCU end is a serial-print / loopback stub.
     because it has no joystick).
   - `uiTask` also owns the UART1 TX for this sprint: on every `linkState` change
     it emits `RING SEARCH_BLINK` / `RING PAIR_BLINK` / `RING CONNECTED` (+ `BUZZ
-    CONNECT` on connect) via `Serial1` (RX 16 / TX 17), mirrored to USB as `tx>`;
-    bytes coming back on UART1 RX print as `rx<` (jumper 17→16 to see the round trip).
+    CONNECT` on connect) via `Serial1` (RX 16 / TX 17), mirrored to USB as `tx>`.
+    With no ring or TCU on this rig those bytes go nowhere; the `tx>` mirror is
+    just there for a later bring-up. RX bytes print as `rx<` (jumper 17→16 if you
+    want to see the round trip).
   - `ISOLATION_TEST` kept, default 0; the uiTask spin now runs against real rendering.
 
 **How to verify**
@@ -186,15 +192,15 @@ pio run -e esp32dev -t upload
 pio device monitor
 ```
 
-1. Boot **bonded**: OLED shows **S1 SCAN** with cycling waves, monitor prints
-   `tx> RING SEARCH_BLINK`, `ui started on core 1` / `bt … link=SEARCH`.
-2. Press **Pair**: OLED → **S2 PAIR**, `tx> RING PAIR_BLINK`, Mode LED fast-blink.
-3. Connect a controller: `tx> RING CONNECTED` + `tx> BUZZ CONNECT`, OLED shows
-   **S3 READY** ~1.5 s then the **S4** HUD. Wiggle the left stick → `ACC` / `REV`
-   / `TURN L` / `TURN R` with the bar tracking, returns to the Idle gamepad glyph
-   ~400 ms after re-centre.
-4. Power the controller off: OLED → **S1 SCAN**, `tx> RING SEARCH_BLINK`,
-   `bt` heartbeat uninterrupted.
+1. Boot **bonded**: OLED shows **S1 SCAN** with the BT glyph + waves cycling
+   none→1→2→3; monitor prints `ui started on core 1` / `bt … link=SEARCH`.
+2. Press **Pair**: OLED blanks below the header divider for ~600 ms (battery
+   strip stays), then shows **S2 PAIR**; Mode LED fast-blink. A second Pair press
+   on S2 shows no blank.
+3. Connect a controller: OLED shows **S3 READY** for ~1.5 s, then the **S4** HUD.
+   Wiggle the left stick → `ACC` / `REV` / `TURN L` / `TURN R` with the bar
+   tracking; ~400 ms after re-centre it returns to the Idle gamepad glyph.
+4. Power the controller off: OLED → **S1 SCAN**; `bt` heartbeat uninterrupted.
 5. Press **Reset**: **S5 RESET…** toast ~1 s → **S2 PAIR**; `Boot: NVS bonded
    flag = 0` on the next power cycle.
 6. Record `bt` / `ui` stack high-water (printed every ~10 beats / ~30 frames);
@@ -202,14 +208,15 @@ pio device monitor
 7. `-D ISOLATION_TEST=1`: uiTask's 3 s spin must not stall `BP32.update()`, and
    btTask's spin must not freeze the OLED. Set back to 0.
 
-**Results** _(fill in after running on hardware)_
+**Results** _(fill in after running on hardware — OLED + buttons only)_
 
-- [ ] boot bonded → S1, `RING SEARCH_BLINK` emitted once
-- [ ] Pair → S2, `RING PAIR_BLINK`; Reset → S5 → S2, bond cleared
-- [ ] connect → S3 (~1.5 s) → S4; sticks drive ACC / REV / TURN with linger
-- [ ] disconnect → S1, heartbeat uninterrupted
-- [ ] stack high-water: bt = ____ words, ui = ____ words
-- [ ] isolation test: OLED redraw and BT poll each ride through the other's spin
+- [y] boot bonded → S1 SCAN, glyph + waves animating
+- [y] Pair → ~600 ms header-only blank → S2 PAIR, Mode LED fast-blink
+- [y] connect → S3 READY (~1.5 s) → S4; sticks drive ACC / REV / TURN L/R, ~400 ms linger → Idle glyph
+- [y] disconnect → S1 SCAN, `bt` heartbeat uninterrupted
+- [y] Reset → S5 RESET… toast → S2 PAIR; NVS bonded flag = 0 next boot
+- [y] stack high-water: bt = 1640 words, ui = 630 words
+- [y] isolation test: OLED redraw and BT poll each ride through the other's spin
 - notes:
 
 ## Step 4a — naive `volatile` shared struct  · branch `step-4a-volatile`

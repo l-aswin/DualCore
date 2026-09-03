@@ -15,10 +15,13 @@
 //     1.3" SH1106 at ~6 Hz (S1 Search / S2 Pair / S3 Connected / S4 stick-check
 //     HUD / S5 Reset toast), AND on every link-state change emits the matching
 //     `RING …` command on UART1 (ECU-SPEC-001 §4). The ring lives on the TCU now
-//     (rev 5) - there are no local pixels here. For this sprint the TCU end is a
-//     loopback / serial-print stub: every command is mirrored to USB as `tx>`,
-//     and anything that comes back on UART1 RX is printed as `rx<` (jumper
-//     GPIO17->GPIO16 to see the round trip).
+//     (rev 5) - there are no local pixels here.
+//
+//     Test rig for step 3 is OLED + the two buttons only - no ring, no TCU. The
+//     `RING …` / `BUZZ …` bytes still go out UART1 TX (GPIO17) and are mirrored
+//     to USB as `tx>`, but nothing receives them; RX bytes print as `rx<`
+//     (jumper GPIO17->GPIO16 for a loopback check). That path is code, not
+//     something this step verifies.
 //
 // Cross-core sharing here is deliberately naive - a handful of `volatile`
 // scalars written by core 0 and read by core 1, no lock. Step 4a promotes that
@@ -31,12 +34,12 @@
 // only; BATT_PCT_STUB stands in for a state-of-charge the ECU never actually
 // receives.
 //
-// Verify (see docs/STEPS.md):
-//   1. boot bonded  -> S1 Search, `tx> RING SEARCH_BLINK`, ui on core 1
-//   2. Pair button  -> S2 Pair,   `tx> RING PAIR_BLINK`
-//   3. controller connects -> S3 Connected (~1.5 s) -> S4 stick-check HUD,
-//      `tx> RING CONNECTED` + `tx> BUZZ CONNECT`; wiggle a stick -> ACC/REV/TURN
-//   4. disconnect -> back to S1, `tx> RING SEARCH_BLINK`
+// Verify (see docs/STEPS.md) - OLED + buttons only:
+//   1. boot bonded -> S1 Search (glyph + waves animating), ui on core 1
+//   2. Pair button -> ~600 ms header-only blank -> S2 Pair, Mode LED fast-blink
+//   3. controller connects -> S3 Connected (~1.5 s) -> S4 stick-check HUD;
+//      wiggle a stick -> ACC / REV / TURN, ~400 ms linger back to the Idle glyph
+//   4. disconnect -> back to S1 Search; bt heartbeat uninterrupted
 //   5. Reset button -> S5 toast (~1 s) -> S2 Pair; NVS bond cleared
 //   6. btTask / uiTask stack high-water recorded, both with headroom
 
