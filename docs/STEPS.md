@@ -61,12 +61,63 @@ pio device monitor
 - [ ] stack high-water: bt = 1667 words, ui = 624 words
 - [ ] isolation test: btTask kept beating through uiTask's spin — yes
 - notes:
-keep loop() with min delay of 10ms. arduino loop runs on core 1. If no sleep is given core1 run at 100% and trigger watchdog warning
 ---
 
 ## Step 2 — Bluepad32 owned by the core-0 task  · branch `step-2-bluepad32`
 
-_not started_
+Branched off the `step-1` tag. Bring the real Bluepad32 stack up **inside `btTask`
+on core 0** and read a gamepad. No pairing state machine yet (step 3); `uiTask`
+stays the step-1 stub. The point of the step is to show the BT stack initialises
+and runs on the pinned core-0 task without disturbing `uiTask` on core 1.
+
+**What changed**
+
+- `platformio.ini`: unchanged — the Bluepad32 custom core was already in place from
+  step 1.
+- `src/main.cpp`:
+  - `#include <Bluepad32.h>`; `controllers[BP32_MAX_GAMEPADS]`, the
+    `onConnectedController` / `onDisconnectedController` handlers, and
+    `inputActive()` / `dumpGamepad()` / `STICK_DEADZONE` copied from
+    `BluetoothPairing` without the NVS / pairing-window code.
+  - `BP32.setup()` moved out of `setup()` and into `btTask`: `setup()` runs on the
+    Arduino loopTask (core 1), and ECU-ADR-004 pins the BT stack to core 0, so init
+    must happen once `btTask` is running. `btTask` then calls
+    `enableVirtualDevice(false)` + `enableNewBluetoothConnections(true)` and drops
+    into a fast loop of `BP32.update()`, printing `dumpGamepad()` on
+    `hasData() && inputActive(ctl)`.
+  - btTask loop delay 1000 ms → ~5 ms so `BP32.update()` is serviced promptly; the
+    heartbeat LED + stack/core log move behind a 1 s `millis()` check.
+  - `uiTask` and `loop()` untouched. `ISOLATION_TEST` kept.
+
+**How to verify**
+
+```
+$env:PATH += ";$env:USERPROFILE\.platformio\penv\Scripts"; pio run -e esp32dev
+pio run -e esp32dev -t upload
+pio device monitor
+```
+
+1. Boot: Bluepad32 init logs from `btTask` on core 0, no `Guru Meditation` /
+   watchdog reset, `ui  alive on core 1` keeps ticking.
+2. Connect a controller — `Controller connected, slot 0`, Mode LED (GPIO2) solid,
+   `dumpGamepad` streams while a stick moves and stops on release.
+3. `ui  alive on core 1  (frame N)` holds its steady 1 Hz cadence through connect,
+   disconnect and active gamepad input — no skipped or bunched frames.
+4. Power the controller off — `Controller disconnected, slot 0`, Mode LED drops,
+   `btTask` heartbeat uninterrupted.
+5. Record the `bt` stack high-water with the BT stack up; confirm headroom.
+6. `-D ISOLATION_TEST=1`: `uiTask`'s 3 s spin must not stall `BP32.update()`, and
+   flipping the spin into `btTask` must not stall `uiTask`. Set the flag back to 0.
+
+**Results** _(fill in after running on hardware)_
+
+- [ yes] Bluepad32 init runs on core 0 from `btTask`, no watchdog reset
+- [ yes] controller connects, `dumpGamepad` streams on input, stops on release
+- [ yes] `uiTask` frame cadence unaffected by connect / disconnect / input
+- [ yes] disconnect handled cleanly, heartbeat uninterrupted
+- [ yes] stack high-water: bt = 1602 words, ui = 616 words
+- [ yes] isolation test: BT poll and `uiTask` each ride through the other's spin
+- notes:
 
 ## Step 3 — pairing state machine (core 0) + OLED / ring-command emit (core 1)  · branch `step-3-pairing-plus-mockup`
 
