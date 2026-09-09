@@ -121,7 +121,7 @@ pio device monitor
 
 ## Step 3 — pairing state machine (core 0) + OLED / ring-command emit (core 1)  · branch `step-3-pairing-state-machine+OLED-display`
 
-Branched off the `step-2` tag. core 0 runs the full pairing state machine; core 1
+Branched off the `step-2` tag. core 0 runs the full pairing state machine(BT stack+buttons+LED); core 1
 renders the OLED screens (ECU-SPEC-002) **and** emits the matching `RING …`
 command on each `linkState` change (no local pixels — the ring is on the TCU).
 
