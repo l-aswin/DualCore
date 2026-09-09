@@ -121,7 +121,7 @@ pio device monitor
 
 ## Step 3 — pairing state machine (core 0) + OLED / ring-command emit (core 1)  · branch `step-3-pairing-state-machine+OLED-display`
 
-Branched off the `step-2` tag. core 0 runs the full pairing state machine(BT stack+buttons+LED); core 1
+Branched off the `step-2` tag. core 0 runs the full pairing state machine; core 1
 renders the OLED screens (ECU-SPEC-002) **and** emits the matching `RING …`
 command on each `linkState` change (no local pixels — the ring is on the TCU).
 
@@ -157,8 +157,12 @@ the ring/UART link is exercised in the TCU sprint.
   - **Cross-core sharing is naive on purpose** — a handful of `volatile` scalars
     (`g_linkState`, `g_hasBond`, `g_connected`, `g_throttle`, `g_steer`,
     `g_connectedAtMs`, `g_resetToastAtMs`, `g_pairBlankAtMs`), core 0 writes,
-    core 1 reads, no lock.
-    Step 4a promotes this to a struct; 4b adds the mutex + snapshot.
+    core 1 reads, no lock. Each field is a native-width (≤32-bit) scalar with a
+    single writer and single reader, so on the ESP32 no individual field ever
+    tears — `volatile` alone is enough for that. What it does *not* guarantee is
+    that two fields read a tick apart (e.g. `linkState` + `connectedAtMs`) came
+    from the same core-0 iteration. Step 4 replaces the loose scalars with a
+    mutex-guarded `RobotState` snapshot to close that gap.
   - **core 1 / `uiTask`** — brings up the SH1106 (`Wire` on 21/22, addr `0x3C`)
     and renders at ~6 Hz (`UI_FRAME_MS` 166): **S1 SCAN** / **S2 PAIR** (shared
     layout, size-3 word + large BT glyph & cycling searching waves), **S3 READY**
@@ -219,13 +223,78 @@ pio device monitor
 - [y] isolation test: OLED redraw and BT poll each ride through the other's spin
 - notes:
 
-## Step 4a — naive `volatile` shared struct  · branch `step-4a-volatile`
+## Step 4 — mutex-protected `RobotState` + snapshot  · branch `step-4-mutex-snapshot`
 
-_not started_
+Branched off the `step-3` tag. Replaces the loose `volatile` scalars core 0
+published for core 1 with one `RobotState` struct guarded by a `portMUX_TYPE`
+spinlock: `btTask` writes into a core-0-only working copy as it goes, then
+does **one** critical-section struct copy into the shared instance per loop
+iteration; `uiTask` takes **one** critical-section struct copy at the top of
+each frame and renders the whole frame off that local copy. This is the fix
+for the gap step 3 left open — individual fields never tore (single
+writer/reader, native ≤32-bit width, which the ESP32 already guarantees
+atomic), but nothing stopped `uiTask` from combining a `linkState` read from
+one `btTask` iteration with a `connectedAtMs` read from the next into one
+inconsistent frame. A snapshot taken under the lock makes every field in one
+`uiTask` frame come from the same `btTask` iteration.
 
-## Step 4b — mutex-protected `RobotState` + snapshot  · branch `step-4b-mutex-snapshot`
+**What changed**
 
-_not started_
+- `src/main.cpp`:
+  - `struct RobotState { LinkState linkState; bool hasBond; bool connected;
+    int32_t throttle; int32_t steer; uint32_t connectedAtMs; uint32_t
+    resetToastAtMs; uint32_t pairBlankAtMs; };` (same fields/defaults as the
+    step-3 globals) plus `portMUX_TYPE g_stateMux` guarding the one shared
+    instance `g_state`.
+  - `RobotState g_pending` — core-0-only, unlocked. Every write site that used
+    to touch a loose global (`persistBonded`, `openPairingWindow`,
+    `resetBondedController`, `pollButtons`, `publishSticks`, the
+    connect/link-state update at the `btTask` loop tail, and the initial values
+    in `setup()`) now writes into `g_pending` instead.
+  - `publishState()` — one `portENTER_CRITICAL`/`portEXIT_CRITICAL` struct copy
+    `g_state = g_pending`, called once at the tail of every `btTask` loop
+    iteration (and once in `setup()` to seed `g_state` before either task
+    starts).
+  - `readState()` — one locked copy `snap = g_state`, called once at the top of
+    every `uiTask` frame; the rest of the frame (screen pick, `RING …` emit,
+    `s4PickAxis()`/`drawS4()`, now both taking `throttle`/`steer` as
+    parameters instead of reading a global) reads only from `snap`.
+  - Lock choice: a `portMUX_TYPE` spinlock, not a FreeRTOS semaphore/mutex —
+    the protected section is a fixed-size struct copy (a handful of scalars),
+    so a spinlock avoids scheduler overhead for something that fast; ESP-IDF's
+    `portMUX_TYPE` is the standard primitive for a short, cross-core critical
+    section like this.
+  - No behaviour change on the OLED/button checklist — this step is about
+    provable consistency, not new features.
+
+**How to verify**
+
+Same checklist as step 3 (OLED + buttons only), plus:
+
+```
+$env:PATH += ";$env:USERPROFILE\.platformio\penv\Scripts"; pio run -e esp32dev
+pio run -e esp32dev -t upload
+pio device monitor
+```
+
+1. Boot bonded → S1 SCAN, glyph + waves animating.
+2. Pair → ~600 ms header-only blank → S2 PAIR, Mode LED fast-blink.
+3. Connect a controller → S3 READY (~1.5 s) → S4 HUD; sticks drive ACC / REV /
+   TURN L/R, ~400 ms linger back to the Idle glyph.
+4. Disconnect → S1 SCAN; `bt` heartbeat uninterrupted.
+5. Reset → S5 RESET… toast (~1 s) → S2 PAIR; NVS bonded flag = 0 next boot.
+6. Record `bt` / `ui` stack high-water — expect roughly the step-3 ballpark
+   (one extra struct copy per iteration/frame is cheap).
+7. Confirm the spinlock doesn't visibly affect `btTask`'s 5 ms poll cadence or
+   `uiTask`'s 166 ms frame cadence — the critical sections are a single
+   ~30-byte struct copy each, so this should be a non-event, but check.
+
+**Results** _(fill in after running on hardware)_
+
+- [ ] step 3 checklist unchanged (all screens/transitions behave identically)
+- [ ] stack high-water: bt = ___ words, ui = ___ words
+- [ ] lock overhead: bt poll / ui frame cadence unaffected
+- notes:
 
 ## Step 5 — `powerState` input + CRITICAL response  · branch `step-5-powerstate`
 
