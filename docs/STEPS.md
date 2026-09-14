@@ -315,12 +315,13 @@ ECU firmware in `07_Codebase_Repository` and for the `MotorDrive` sprint.
 
 Carry-overs for whatever clones this code:
 
-- **Set `ISOLATION_TEST` to `0`.** `src/main.cpp` still has it at `1`, which busy-spins
-  each core for 3 s as a test. With motor PWM on core 0, that would hold the motors at
-  their last duty for 3 s.
-- **G4 loop-timing verdict not yet measured.** The btTask loop interval (min / max / mean
-  over 60 s, ECU-SPEC-001 §9) still needs to be recorded — best done once motor PWM is
-  running on core 0, since that is the load G4 cares about.
+- **`ISOLATION_TEST` is sprint-only.** It stays in this repo as a test harness; the
+  ECU-firmware clone removes the logic.
+- **G4 loop-timing verdict not yet measured.** The ECU-SPEC-001 §9 numbers still need to be
+  recorded — best done once motor PWM is running, since that is the load G4 cares about. Per
+  ECU-ADR-004 amendment 2, PWM lives in `motorControlTask` on **core 1**, woken by `btTask`
+  via `xTaskNotify`: measure its cycle interval (min / max over 60 s) and the input→PWM
+  latency.
 - **`powerState` / S0 Battery Critical** — not built in this sprint.
 
 
