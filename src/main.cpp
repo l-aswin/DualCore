@@ -1,32 +1,39 @@
-// NitroWorks ECU - DualCore sprint - STEP 3: pairing state machine (core 0)
-//                                            + OLED screens / RING-command emit (core 1)
+// NitroWorks ECU - DualCore sprint - STEP 4: mutex-protected RobotState + snapshot
+//                                            (pairing state machine core 0 / OLED core 1 unchanged)
 //
-// Step 2 brought Bluepad32 up inside btTask on core 0 and dumped raw gamepad
-// input; uiTask was still a frame-counter stub. Step 3 makes both cores do their
-// real job:
+// Step 3 made both cores do their real job (pairing state machine on core 0,
+// OLED + RING-command emit on core 1) but shared the result as a handful of
+// loose `volatile` scalars, no lock - deliberately naive. Each individual field
+// was already safe (native-width scalar, one writer core, one reader core - the
+// ESP32 doesn't tear those), but nothing stopped uiTask from combining fields
+// read a few instructions apart into one inconsistent frame: it could read
+// `linkState` from one btTask iteration and `connectedAtMs` from the next.
 //
-//   core 0 / btTask  - the full pairing state machine cloned from the
-//     BluetoothPairing sprint: NVS `bonded` flag, Pair + Reset buttons,
-//     open/close pairing window, the "reject unexpected controller" guard. It
-//     boils the result down to a link state (SEARCH / PAIR / CONNECTED) plus the
-//     live stick values and publishes them for core 1.
+// Step 4 closes that gap without changing behaviour:
 //
-//   core 1 / uiTask  - renders the OLED screen set from ECU-SPEC-002 on the
-//     1.3" SH1106 at ~6 Hz (S1 Search / S2 Pair / S3 Connected / S4 stick-check
-//     HUD / S5 Reset toast), AND on every link-state change emits the matching
-//     `RING …` command on UART1 (ECU-SPEC-001 §4). The ring lives on the TCU now
-//     (rev 5) - there are no local pixels here.
+//   core 0 / btTask  - unchanged pairing state machine, but now writes into a
+//     core-0-only `RobotState g_pending` as it goes (no lock needed - only
+//     btTask ever touches it), then does ONE spinlock-protected struct copy
+//     (`publishState()`) into the shared `g_state` at the tail of each loop
+//     iteration. One critical section per iteration, not one per field.
 //
-//     Test rig for step 3 is OLED + the two buttons only - no ring, no TCU. The
+//   core 1 / uiTask  - takes ONE spinlock-protected copy (`readState()`) at the
+//     top of each frame into a local `RobotState snap`, then renders the whole
+//     frame off `snap`. Every field in that frame is guaranteed to come from
+//     the same btTask iteration.
+//
+// The lock is a `portMUX_TYPE` spinlock (`portENTER_CRITICAL` /
+// `portEXIT_CRITICAL`), not a FreeRTOS semaphore/mutex - the protected section
+// is just a fixed-size struct copy (a handful of scalars), so a spinlock avoids
+// the scheduler overhead of a semaphore for something that fast, and ESP-IDF's
+// portMUX_TYPE is specifically the primitive for a short, code-only critical
+// section shared between the two cores.
+//
+//     Test rig for step 4 is OLED + the two buttons only - no ring, no TCU. The
 //     `RING …` / `BUZZ …` bytes still go out UART1 TX (GPIO17) and are mirrored
 //     to USB as `tx>`, but nothing receives them; RX bytes print as `rx<`
 //     (jumper GPIO17->GPIO16 for a loopback check). That path is code, not
 //     something this step verifies.
-//
-// Cross-core sharing here is deliberately naive - a handful of `volatile`
-// scalars written by core 0 and read by core 1, no lock. Step 4a promotes that
-// to a shared struct and step 4b adds the mutex + snapshot; step 3 is the
-// "before" picture on purpose.
 //
 // powerState / S0 Battery Critical / the warning strip are NOT in this step -
 // battery sensing is the BMS's (ECU-SPEC-001 rev 5) and the simulated
@@ -34,14 +41,15 @@
 // only; BATT_PCT_STUB stands in for a state-of-charge the ECU never actually
 // receives.
 //
-// Verify (see docs/STEPS.md) - OLED + buttons only:
+// Verify (see docs/STEPS.md) - OLED + buttons only, behaviour identical to step 3:
 //   1. boot bonded -> S1 Search (glyph + waves animating), ui on core 1
-//   2. Pair button -> ~600 ms header-only blank -> S2 Pair, Mode LED fast-blink
+//   2. Pair button -> ~600 ms header-only blank -> S2 Pair, Mode LED off
 //   3. controller connects -> S3 Connected (~1.5 s) -> S4 stick-check HUD;
 //      wiggle a stick -> ACC / REV / TURN, ~400 ms linger back to the Idle glyph
 //   4. disconnect -> back to S1 Search; bt heartbeat uninterrupted
 //   5. Reset button -> S5 toast (~1 s) -> S2 Pair; NVS bond cleared
 //   6. btTask / uiTask stack high-water recorded, both with headroom
+//   7. lock overhead: bt poll (~5 ms) / ui frame (~166 ms) cadence unaffected
 
 #include <Arduino.h>
 #include <string.h>
@@ -53,13 +61,13 @@
 
 // Set to 1 to make uiTask burn 3 s of core 1 every ~10 frames - btTask's
 // BP32.update() must stay responsive through it. Ship at 0.
-#define ISOLATION_TEST 0
+#define ISOLATION_TEST 1
 
 // ---- pins --------------------------------------------------------------------
 // Buttons keep the BluetoothPairing test-rig wiring (active-low, internal
 // pull-up). ECU-SPEC-001 §2 puts Reset on GPIO14 and Pair on an input-only pin
 // on the final board; the perfboard rig this sprint runs on uses 15 / 13.
-constexpr int PIN_MODE_LED   = 2;    // solid = connected, blink = searching/pairing (also btTask heartbeat)
+constexpr int PIN_MODE_LED   = 2;    // HIGH = connected, LOW = searching/pairing - binary only, no blink pattern coded
 constexpr int PIN_PAIR_BTN   = 15;   // Pair button   (HIGH -> LOW edge = press)
 constexpr int PIN_RESET_BTN  = 13;   // Reset button  (clears the stored bond)
 constexpr int PIN_I2C_SDA    = 21;   // SH1106 OLED
@@ -68,7 +76,6 @@ constexpr int PIN_UART1_RX   = 16;   // UART1 <- TCU  (ECU-SPEC-001 §2)
 constexpr int PIN_UART1_TX   = 17;   // UART1 -> TCU  (RING / BUZZ commands)
 
 // ---- tunables --------------------------------------------------------------
-constexpr int32_t  STICK_DEADZONE  = 24;    // input-active test (buttons/dump)
 constexpr int32_t  AXIS_MAX        = 512;   // Bluepad32 stick full-scale
 constexpr int32_t  S4_DEADZONE     = 60;    // ~12 % of AXIS_MAX (ECU-SPEC-002 §7.6 - tune on hw)
 constexpr uint32_t S4_LINGER_MS    = 400;   // active axis re-centred -> hold before Idle
@@ -100,16 +107,43 @@ static const char* ringCmdFor(LinkState s) {
   return "OFF";
 }
 
-// ---- cross-core shared state (core 0 writes, core 1 reads - NAIVE, no lock) --
-// Step 4a turns this into a struct; step 4b adds the mutex + snapshot.
-volatile LinkState g_linkState     = LINK_PAIR;
-volatile bool      g_hasBond       = false;
-volatile bool      g_connected     = false;
-volatile int32_t   g_throttle      = 0;   // +forward / -reverse, ~AXIS_MAX scale
-volatile int32_t   g_steer         = 0;   // +right / -left
-volatile uint32_t  g_connectedAtMs  = 0;  // millis() of the last 0->1 connect edge
-volatile uint32_t  g_resetToastAtMs = 0;  // millis() of the last Reset press (0 = none)
-volatile uint32_t  g_pairBlankAtMs  = 0;  // millis() of the last Pair press (0 = none) - drives the S2 feedback frame
+// ---- cross-core shared state (core 0 writes, core 1 reads, mutex-guarded) ---
+struct RobotState {
+  LinkState linkState     = LINK_PAIR;
+  bool      hasBond       = false;
+  bool      connected     = false;
+  int32_t   throttle      = 0;   // +forward / -reverse, ~AXIS_MAX scale
+  int32_t   steer         = 0;   // +right / -left
+  uint32_t  connectedAtMs  = 0;  // millis() of the last 0->1 connect edge
+  uint32_t  resetToastAtMs = 0;  // millis() of the last Reset press (0 = none)
+  uint32_t  pairBlankAtMs  = 0;  // millis() of the last Pair press (0 = none) - drives the S2 feedback frame
+};
+
+RobotState   g_state;                                   // the shared copy - touch only under g_stateMux
+portMUX_TYPE g_stateMux = portMUX_INITIALIZER_UNLOCKED;  // spinlock guarding g_state
+
+// core-0-only working copy - btTask reads/writes this freely with no locking
+// (nothing else ever touches it), then flushes the whole thing into g_state
+// under the spinlock once per loop iteration via publishState(). This keeps
+// the critical section to a single struct copy instead of one per field.
+RobotState g_pending;
+
+void publishState() {
+  portENTER_CRITICAL(&g_stateMux);
+  g_state = g_pending;
+  portEXIT_CRITICAL(&g_stateMux);
+}
+
+// core-1-only: one locked copy of g_state per uiTask frame. uiTask renders the
+// whole frame off the returned snapshot, so every field it reads comes from
+// the same btTask iteration.
+RobotState readState() {
+  RobotState snap;
+  portENTER_CRITICAL(&g_stateMux);
+  snap = g_state;
+  portEXIT_CRITICAL(&g_stateMux);
+  return snap;
+}
 
 // ---- Bluepad32 + pairing (core 0) ------------------------------------------
 ControllerPtr controllers[BP32_MAX_GAMEPADS];
@@ -158,7 +192,7 @@ bool pairingWindowOpen() { return pairingMode; }
 void persistBonded(bool v) {
   size_t n = prefs.putBool(NVS_KEY_BONDED, v);
   hasBondedController = v;
-  g_hasBond = v;
+  g_pending.hasBond = v;
   Serial.printf("persistBonded(%d) -> %u bytes written\n", v, (unsigned)n);
 }
 
@@ -170,10 +204,12 @@ bool anyControllerConnected() {
 }
 
 void openPairingWindow() {
-  // Flip the UI-visible state FIRST so core 1 paints S2 Pair on its very next
-  // frame - don't wait for the end-of-loop computeLinkState().
+  // Flip the pending state FIRST so it wins over computeLinkState()'s result
+  // later this same btTask iteration - both land in g_state together at the
+  // single publishState() call at the loop tail, so core 1 still sees PAIR on
+  // its very next frame; nothing here waits for computeLinkState().
   pairingMode = true;
-  g_linkState = LINK_PAIR;
+  g_pending.linkState = LINK_PAIR;
 
   // Disconnect the active controller and (soon) forget the stored key, then open
   // up for one new controller. forgetBluetoothKeys() is all-or-nothing, so it
@@ -209,7 +245,7 @@ void closePairingWindow(const char* why) {
 void resetBondedController() {
   Serial.println("Reset button - clearing stored bond");
   persistBonded(false);
-  g_resetToastAtMs = millis();
+  g_pending.resetToastAtMs = millis();
   openPairingWindow();
 }
 
@@ -219,7 +255,10 @@ void pollButtons() {
     // Intentional press feedback: blank everything below the header for
     // PAIR_BLANK_MS. Only when entering PAIR from SCAN / CONNECTED - a re-press
     // while already pairing just restarts discovery, no visual blank.
-    if (g_linkState != LINK_PAIR) g_pairBlankAtMs = millis();
+    // g_pending.linkState still holds the last PUBLISHED value here (this
+    // iteration hasn't called publishState() yet), so this compares against
+    // what core 1 actually last saw - same as reading g_state would.
+    if (g_pending.linkState != LINK_PAIR) g_pending.pairBlankAtMs = millis();
     openPairingWindow();
   }
   if (buttonPressed(resetBtn)) {
@@ -275,16 +314,6 @@ void onDisconnectedController(ControllerPtr ctl) {
   }
 }
 
-bool inputActive(ControllerPtr ctl) {
-  if (ctl->buttons() || ctl->miscButtons() || ctl->dpad()) return true;
-  return abs(ctl->axisX())    > STICK_DEADZONE ||
-         abs(ctl->axisY())    > STICK_DEADZONE ||
-         abs(ctl->axisRX())   > STICK_DEADZONE ||
-         abs(ctl->axisRY())   > STICK_DEADZONE ||
-         abs(ctl->brake())    > STICK_DEADZONE ||
-         abs(ctl->throttle()) > STICK_DEADZONE;
-}
-
 // Reduce the whole gamepad to the two axes the S4 stick-check HUD cares about:
 // throttle = left stick vertical (up = forward, so negate axisY), steer = axisX.
 void publishSticks() {
@@ -293,8 +322,8 @@ void publishSticks() {
     ControllerPtr ctl = controllers[i];
     if (ctl && ctl->isConnected()) { thr = -ctl->axisY(); str = ctl->axisX(); break; }
   }
-  g_throttle = thr;
-  g_steer    = str;
+  g_pending.throttle = thr;
+  g_pending.steer    = str;
 }
 
 LinkState computeLinkState() {
@@ -344,16 +373,20 @@ void btTask(void*) {
     }
 
     bool nowConnected = anyControllerConnected();
-    if (nowConnected && !wasConnected) g_connectedAtMs = millis();
+    if (nowConnected && !wasConnected) g_pending.connectedAtMs = millis();
     wasConnected = nowConnected;
-    g_connected  = nowConnected;
-    g_linkState  = computeLinkState();
+    g_pending.connected  = nowConnected;
+    g_pending.linkState  = computeLinkState();
+
+    // One critical-section struct copy for this whole iteration's changes -
+    // see the RobotState comment above.
+    publishState();
 
     uint32_t now = millis();
     if (now - lastHeartbeat >= BT_HEARTBEAT_MS) {
       lastHeartbeat = now;
       Serial.printf("bt  alive on core %d  link=%s  (beat %lu)\n",
-                    xPortGetCoreID(), LINK_NAME[g_linkState], (unsigned long)beats);
+                    xPortGetCoreID(), LINK_NAME[g_pending.linkState], (unsigned long)beats);
       if ((beats % 10) == 9) logStack("bt ");
       beats++;
     }
@@ -383,8 +416,9 @@ bool g_oledOk = false;
 // 06_Code_Sprints/BluetoothUIMockup/src/main.cpp - the pixel-accurate reference
 // for ECU-SPEC-002, tuned on the real 1.3" SH1106. Do NOT re-derive them from
 // the spec text; if a screen changes, change it in the mockup first, then copy
-// it here. DualCore only supplies the live inputs: g_linkState picks the screen
-// and the real gamepad sticks (g_throttle / g_steer) drive S4 via s4PickAxis().
+// it here. DualCore only supplies the live inputs: the per-frame RobotState
+// snapshot's linkState picks the screen and the real gamepad sticks (throttle /
+// steer) drive S4 via s4PickAxis().
 #define W SH110X_WHITE
 
 // Only two strip states: normal and warning. Critical takes the whole screen
@@ -487,11 +521,10 @@ void fillTri(int x, int y, int w, int h, bool pointRight) {
 // One axis owns Area 2; ~400 ms linger back to Idle (ECU-SPEC-002 §4).
 enum S4Axis : uint8_t { S4_IDLE, S4_ACC, S4_REV, S4_TURN_L, S4_TURN_R };
 
-S4Axis s4PickAxis() {
+S4Axis s4PickAxis(int32_t thr, int32_t str) {
   static S4Axis   held     = S4_IDLE;
   static uint32_t lingerAt = 0;
 
-  int32_t thr = g_throttle, str = g_steer;
   bool thrActive = abs(thr) >= S4_DEADZONE;
   bool strActive = abs(str) >= S4_DEADZONE;
 
@@ -515,9 +548,10 @@ S4Axis s4PickAxis() {
 // right-aligned value, ACC-left / REV-right / TURN centre-out, idle gamepad
 // glyph). The state comes from s4PickAxis() and the magnitude `m` from the live
 // axis rescaled past the deadzone, replacing the mockup's synthetic sine.
-void drawS4() {
+// thr/str come from this frame's RobotState snapshot (see uiTask).
+void drawS4(int32_t thr, int32_t str) {
   drawStatusStrip(BATT_NORMAL, BATT_PCT_STUB, true);
-  S4Axis axis = s4PickAxis();
+  S4Axis axis = s4PickAxis(thr, str);
 
   if (axis == S4_IDLE) {                                    // idle gamepad glyph
     display.drawRoundRect(40, 32, 48, 20, 8, W);            // gamepad body
@@ -529,7 +563,7 @@ void drawS4() {
   }
 
   const int BX = 4, BY = 40, BW = 120, BH = 16;
-  int32_t raw = (axis == S4_ACC || axis == S4_REV) ? g_throttle : g_steer;
+  int32_t raw = (axis == S4_ACC || axis == S4_REV) ? thr : str;
   float m = (float)(abs(raw) - S4_DEADZONE) / (float)(AXIS_MAX - S4_DEADZONE);
   m = constrain(m, 0.0f, 1.0f);
 
@@ -609,12 +643,16 @@ void uiTask(void*) {
   uint32_t frames = 0;
 
   for (;;) {
+    // One locked copy for the whole frame - every field below comes from the
+    // same btTask iteration (see publishState()/readState()).
+    RobotState snap = readState();
+
     // ---- pick the screen (ECU-SPEC-002 §5), powerState omitted (step 5) ----
-    LinkState link   = g_linkState;
-    bool connected   = g_connected;
-    uint32_t connAt  = g_connectedAtMs;
-    uint32_t resetAt = g_resetToastAtMs;
-    uint32_t pairAt  = g_pairBlankAtMs;
+    LinkState link   = snap.linkState;
+    bool connected   = snap.connected;
+    uint32_t connAt  = snap.connectedAtMs;
+    uint32_t resetAt = snap.resetToastAtMs;
+    uint32_t pairAt  = snap.pairBlankAtMs;
     uint32_t now     = millis();
 
     bool showReset = resetAt != 0 && (now - resetAt) < RESET_TOAST_MS;
@@ -636,8 +674,8 @@ void uiTask(void*) {
       if (showReset) {
         drawResetToast();
       } else if (link == LINK_CONNECTED) {
-        if (now - connAt < S3_HOLD_MS) renderConnected();  // S3
-        else                           drawS4();           // S4 stick-check HUD
+        if (now - connAt < S3_HOLD_MS) renderConnected();                    // S3
+        else                           drawS4(snap.throttle, snap.steer);    // S4 stick-check HUD
       } else if (link == LINK_PAIR) {
         if (pairBlank)
           drawStatusStrip(BATT_NORMAL, BATT_PCT_STUB, false);   // header only - Pair-press feedback
@@ -683,11 +721,12 @@ void setup() {
   Serial.println("NITRO_QA_RESET_NVS: cleared stored bond");
 #endif
   hasBondedController = prefs.getBool(NVS_KEY_BONDED, false);
-  g_hasBond = hasBondedController;
-  g_linkState = hasBondedController ? LINK_SEARCH : LINK_PAIR;
+  g_pending.hasBond   = hasBondedController;
+  g_pending.linkState = hasBondedController ? LINK_SEARCH : LINK_PAIR;
+  publishState();   // both tasks are created below, but seed g_state before they run either way
 
   Serial.println();
-  Serial.println("NitroWorks ECU - DualCore sprint - STEP 3 (pairing state machine + OLED / RING emit)");
+  Serial.println("NitroWorks ECU - DualCore sprint - STEP 4 (mutex-protected RobotState + snapshot)");
   Serial.printf("setup() runs on core %d\n", xPortGetCoreID());
   Serial.printf("Boot: NVS bonded flag = %d\n", hasBondedController);
   Serial.printf("free heap before tasks: %u B  (largest block %u B)\n",

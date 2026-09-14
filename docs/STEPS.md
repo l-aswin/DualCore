@@ -57,9 +57,9 @@ pio device monitor
 
 **Results** _(fill in after running on hardware)_
 
-- [ ] both tasks report the expected cores - yes
-- [ ] stack high-water: bt = 1667 words, ui = 624 words
-- [ ] isolation test: btTask kept beating through uiTask's spin — yes
+- [ y] both tasks report the expected cores - yes
+- [ y] stack high-water: bt = 1667 words, ui = 624 words
+- [ y] isolation test: btTask kept beating through uiTask's spin — yes
 - notes:
 ---
 
@@ -199,8 +199,9 @@ pio device monitor
 1. Boot **bonded**: OLED shows **S1 SCAN** with the BT glyph + waves cycling
    none→1→2→3; monitor prints `ui started on core 1` / `bt … link=SEARCH`.
 2. Press **Pair**: OLED blanks below the header divider for ~600 ms (battery
-   strip stays), then shows **S2 PAIR**; Mode LED fast-blink. A second Pair press
-   on S2 shows no blank.
+   strip stays), then shows **S2 PAIR**; Mode LED off (the LED is binary in
+   this code — HIGH only on CONNECTED, LOW otherwise, no blink pattern coded).
+   A second Pair press on S2 shows no blank.
 3. Connect a controller: OLED shows **S3 READY** for ~1.5 s, then the **S4** HUD.
    Wiggle the left stick → `ACC` / `REV` / `TURN L` / `TURN R` with the bar
    tracking; ~400 ms after re-centre it returns to the Idle gamepad glyph.
@@ -215,7 +216,9 @@ pio device monitor
 **Results** _(fill in after running on hardware — OLED + buttons only)_
 
 - [y] boot bonded → S1 SCAN, glyph + waves animating
-- [y] Pair → ~600 ms header-only blank → S2 PAIR, Mode LED fast-blink
+- [y] Pair → ~600 ms header-only blank → S2 PAIR, Mode LED off (checked against
+      the doc's stale "fast-blink" claim at the time — the code has only ever
+      driven this LED HIGH/LOW, no blink pattern; corrected here after review)
 - [y] connect → S3 READY (~1.5 s) → S4; sticks drive ACC / REV / TURN L/R, ~400 ms linger → Idle glyph
 - [y] disconnect → S1 SCAN, `bt` heartbeat uninterrupted
 - [y] Reset → S5 RESET… toast → S2 PAIR; NVS bonded flag = 0 next boot
@@ -278,7 +281,8 @@ pio device monitor
 ```
 
 1. Boot bonded → S1 SCAN, glyph + waves animating.
-2. Pair → ~600 ms header-only blank → S2 PAIR, Mode LED fast-blink.
+2. Pair → ~600 ms header-only blank → S2 PAIR, Mode LED off (binary indicator
+   only — no blink pattern coded).
 3. Connect a controller → S3 READY (~1.5 s) → S4 HUD; sticks drive ACC / REV /
    TURN L/R, ~400 ms linger back to the Idle glyph.
 4. Disconnect → S1 SCAN; `bt` heartbeat uninterrupted.
@@ -291,27 +295,9 @@ pio device monitor
 
 **Results** _(fill in after running on hardware)_
 
-- [ ] step 3 checklist unchanged (all screens/transitions behave identically)
-- [ ] stack high-water: bt = ___ words, ui = ___ words
-- [ ] lock overhead: bt poll / ui frame cadence unaffected
+- [ y] step 3 checklist unchanged (all screens/transitions behave identically)
+- [ y] stack high-water: bt = 1651 words, ui = 621 words
+- [ y] lock overhead: bt poll / ui frame cadence unaffected
 - notes:
 
-## Step 5 — `powerState` input + CRITICAL response  · branch `step-5-powerstate`
 
-_not started._ Battery *sensing* is the BMS's now (ECU-SPEC-001 rev 5), so this step
-no longer reads a divider. It feeds a simulated `powerState` (button or timer →
-`WARNING` → `CRITICAL`) into `RobotState` and exercises the ECU's reaction under the
-core split: `motor_control` zeros + holds, the BLE path tears down, `oled_ui` shows S0,
-`led_pattern` emits `RING OFF` + `BUZZ S0`. The G4-relevant question is whether the
-split holds timing while a CRITICAL event forces a screen change + motor stop at once.
-
----
-
-## G4 verdict
-
-_Pending. After step 5, run with everything active (gamepad connected, stick
-moving, OLED redrawing S4, `RING …` / `BUZZ …` commands going out on UART1, a
-simulated `powerState` CRITICAL forcing S0 + motor stop) and log the `btTask`
-loop-interval min/max/mean over 60 s. "Split holds" feeds the initial commit of
-`07_Codebase_Repository`; "needs amendment" goes back into ECU-ADR-004 /
-ECU-SPEC-001 §9._

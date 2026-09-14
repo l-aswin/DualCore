@@ -1,0 +1,44 @@
+They're two different levels of the NVS (Non-Volatile Storage) addressing scheme — ESP32's key/value store in flash. Every value you save needs both a namespace and a key.
+
+NVS_NS = "nitro-ecu" — the namespace. Think of it as a folder or a table name.
+NVS_KEY_BONDED = "bonded" — the key (the actual variable name) inside that namespace. It's used at every read/write of that specific flag.
+
+core 0 / btTask  - unchanged pairing state machine, but now writes into a core-0-only `RobotState g_pending` as it goes (no lock needed - only btTask ever touches it), then does ONE spinlock-protected struct copy (`publishState()`) into the shared `g_state` at the tail of each loop iteration. One critical section per iteration, not one per field.
+
+struct RobotState {
+  LinkState linkState     = LINK_PAIR;
+  bool      hasBond       = false;
+  bool      connected     = false;
+  int32_t   throttle      = 0;   // +forward / -reverse, ~AXIS_MAX scale
+  int32_t   steer         = 0;   // +right / -left
+  uint32_t  connectedAtMs  = 0;  // millis() of the last 0->1 connect edge
+  uint32_t  resetToastAtMs = 0;  // millis() of the last Reset press (0 = none)
+  uint32_t  pairBlankAtMs  = 0;  // millis() of the last Pair press (0 = none) - drives the S2 feedback frame
+};
+
+"AtMs" = "at [time in] milliseconds" — i.e., "the millis() timestamp at which this happened."
+connectedAtMs — set once, on the 0→1 edge when a controller connects.uiTask uses it to decide S3(READY) vs S4(stick_hud).
+resetToastAtMs — set when the Reset button fires. uiTask uses it to show the "RESET…" toast for exactly RESET_TOAST_MS (1 s) and then fall through to S2(PAIR)
+pairBlankAtMs — set when Pair is pressed while not already pairing (main.cpp:262). Drives a brief header-only blank frame (PAIR_BLANK_MS = 600 ms) as press feedback before S2 actually renders.
+enum LinkState : uint8_t { LINK_SEARCH = 0, LINK_PAIR = 1, LINK_CONNECTED = 2 };
+
+Why timestamps instead of, say, a bool flag or a countdown? A few reasons this pattern is used three times here:
+1. Core 0 never has to "cancel" a timer. It just stamps millis() once at the event. Core 1 does all the "is this still active?" math itself, every frame, from now - stamp < DURATION. No cross-core coordination needed to turn a toast off — it just ages out.
+2. Survives being read at an arbitrary offset. Since uiTask only samples state every ~166 ms (not synchronized to the event), it needs to know how far into the toast/blank/hold window it currently is, not just "on/off" — a plain bool couldn't reconstruct that.
+3. 0 as "none" sentinel. All three start at 0 and the != 0 check means "never fired" — real millis() values are never 0 after boot for long, so it's a safe sentinel without needing a separate bool.
+
+
+core 1 / uiTask  - takes ONE spinlock-protected copy (`readState()`) at the top of each frame into a local `RobotState snap`, then renders the whole frame off `snap`. Every field in that frame is guaranteed to come from the same btTask iteration.
+Why a spinlock, not a semaphore/mutex
+The protected section here is tiny — copying ~30 bytes, a handful of CPU cycles. A FreeRTOS semaphore (xSemaphoreTake/Give) involves scheduler bookkeeping that's overkill for something this fast, and could even suspend the task before yielding, which is the wrong direction on a real-time task like btTask. portMUX_TYPE + portENTER_CRITICAL/portEXIT_CRITICAL is exactly the ESP-IDF-recommended primitive for a short, code-only critical section shared between the two cores.
+
+the debounce logic
+struct Button {
+  int pin;               // which GPIO this button is wired to
+  int stable;             // the last DEBOUNCED (trusted) reading: HIGH or LOW
+  int lastReading;        // the RAW reading from the most recent digitalRead()
+  uint32_t lastChangeMs;  // millis() timestamp of when lastReading last changed
+};
+
+Why this shape is needed — the debounce logic
+A mechanical button, when pressed, doesn't cleanly go from HIGH to LOW — it "bounces," rapidly toggling for a few milliseconds before settling. If you acted on every raw transition, one press could register as 5 presses.
