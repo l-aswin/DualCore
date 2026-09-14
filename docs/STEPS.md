@@ -1,15 +1,18 @@
 # DualCore — staged build log
 
 This sprint splits the ECU firmware across the ESP32's two cores (ECU-ADR-004):
-**core 0** = Bluepad32 + gamepad (`btTask`), **core 1** = OLED + `led_pattern`
+**core 0** = Bluepad32 + gamepad (`btTask`), **core 1** = OLED + `RING …` / `BUZZ …`
 command emit (`uiTask`). It clones `BluetoothPairing` and adds the core split, then
-wires the OLED to real Bluetooth events and real stick input, then adds the
-`powerState` input and the CRITICAL response.
+wires the OLED to real Bluetooth events and real stick input, then makes the
+cross-core state sharing consistent with a spinlock-guarded snapshot.
+
+**Status: complete — 4 steps.** There is no Step 5: the `powerState` input and the
+CRITICAL response are out of this sprint's scope.
 
 > **Rev 5 note (2026-09-01):** the WS2812B ring + buzzer moved to the TCU
 > and battery sensing moved to the BMS (ECU-SPEC-001 rev 5). So `uiTask` no longer
 > *animates* LEDs — it emits `RING …` / `BUZZ …` commands over UART1 — and there is
-> no on-ECU `battTask`. Steps 3 and 5 below reflect that.
+> no on-ECU `battTask`. Step 3 below reflects that.
 
 The user's "Core 1 / Core 2" = the ESP32's core 0 / core 1.
 
@@ -17,8 +20,10 @@ Each step lives on its own branch (`step-N-...`), branched off the previous
 step's merged tip. Many commits per branch is fine. Merge to `main` when the
 step's verification passes, then tag the merge `step-N`.
 
-The sprint's real deliverable is the **G4 verdict** (ECU-SPEC-001 §9): does the
-core split hold timing with the OLED redrawing? Recorded at the bottom.
+The sprint's intended deliverable was the **G4 verdict** (ECU-SPEC-001 §9): does the
+core split hold timing with the OLED redrawing? The isolation tests and cadence checks
+below passed, but the btTask loop-interval measurement (min / max / mean over 60 s) was
+not recorded — see "Sprint close-out" at the bottom.
 
 ---
 
@@ -171,7 +176,7 @@ the ring/UART link is exercised in the TCU sprint.
     `TURN L` / `TURN R` with a rescaled % bar; most-recently-active axis owns
     Area 2 with a 400 ms linger back to Idle), **S5 RESET…** toast (~1 s after the
     Reset button, then falls through to S2). Status strip renders its **normal**
-    state only — `powerState` / warning / **S0** are step 5, and `BATT_PCT_STUB`
+    state only — `powerState` / warning / **S0** are outside this sprint, and `BATT_PCT_STUB`
     stands in for a state-of-charge the ECU never actually receives (BMS owns it).
   - The OLED draw helpers (`drawBtGlyph` / `drawWaves` / `drawStatusStrip` /
     `drawWord` / `renderSearchLike` / `renderConnected` / `fillTri` / the S4
@@ -226,7 +231,7 @@ pio device monitor
 - [y] isolation test: OLED redraw and BT poll each ride through the other's spin
 - notes:
 
-## Step 4 — mutex-protected `RobotState` + snapshot  · branch `step-4-mutex-snapshot`
+## Step 4 — spinlock-protected `RobotState` + snapshot  · branch `step-4-spinlock`
 
 Branched off the `step-3` tag. Replaces the loose `volatile` scalars core 0
 published for core 1 with one `RobotState` struct guarded by a `portMUX_TYPE`
@@ -299,5 +304,23 @@ pio device monitor
 - [ y] stack high-water: bt = 1651 words, ui = 621 words
 - [ y] lock overhead: bt poll / ui frame cadence unaffected
 - notes:
+
+---
+
+## Sprint close-out
+
+**DualCore is complete at 4 steps** (tags `step-1` … `step-4`, pushed to
+[github.com/l-aswin/DualCore](https://github.com/l-aswin/DualCore)). It is the base for the
+ECU firmware in `07_Codebase_Repository` and for the `MotorDrive` sprint.
+
+Carry-overs for whatever clones this code:
+
+- **Set `ISOLATION_TEST` to `0`.** `src/main.cpp` still has it at `1`, which busy-spins
+  each core for 3 s as a test. With motor PWM on core 0, that would hold the motors at
+  their last duty for 3 s.
+- **G4 loop-timing verdict not yet measured.** The btTask loop interval (min / max / mean
+  over 60 s, ECU-SPEC-001 §9) still needs to be recorded — best done once motor PWM is
+  running on core 0, since that is the load G4 cares about.
+- **`powerState` / S0 Battery Critical** — not built in this sprint.
 
 
